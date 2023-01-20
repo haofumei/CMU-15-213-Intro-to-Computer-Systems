@@ -313,7 +313,7 @@ So we can build this corresponding table to figure out the secret:
 | r      | 6             | 0x0110      |
 | s      | 7             | 0x0111      |
 
-We can just select the printable chars from ascii table where ending at this 6 bit to construct the secret, for example, ionefg.
+We can just select the 6 printable chars from ascii table where ending at this 4 bits to construct the secret, for example, ionefg.
 
 # Phase 6:
 
@@ -415,7 +415,7 @@ Dump of assembler code for function phase_6:
 End of assembler dump.
 ```
 
-Part1: 
+Part1:
 
 Secrets are six number and 0 <= num - 1 <= 5, which is 1 <= num <= 6
 
