@@ -13,16 +13,16 @@
  * | block size | a/f | footer
  * --------------------
  * with heap list:
- *------------------   -----------------------------------   --------------   ---------------*
- | alignment padding | prologue header (pred, succ) footer | regular blocks | epilogue header | 
- *------------------   -----------------------------------   --------------   ---------------*
+ *------------------   ---------------------------------   --------------   ---------------*
+ | alignment padding | prologue header | prologue footer | regular blocks | epilogue header | 
+ *------------------   ---------------------------------   --------------   ---------------*
  * with LIFO list and first fit policy:
  *----------------       -------------      ------
- | prologue block | <-> | free blocks | -> | tail | 
+ | free block ptr | <-> | free blocks | -> | tail | 
  *----------------       -------------      ------
  * 
  * modify
- * mm_init: add 16 bits for head of free block
+ * mm_init: 
  * 1. free block pointer fbp points to first free block
  * 2. pred of frist free block points the address of fbp pointer
  * 2. succ of last free block points to the address of tail pointer
@@ -41,10 +41,9 @@
  * case 1: both allocated, case 2: next is not allocated
  * case 3: prev is not allocated, case 4: both are not allocated
  * 1. case 1: return
- * 2. case 2: get pred and succ of next, coalesce them, and link pred and succ with coalesced block again
- * 3. case 3: just coalesce them
- * 4. case 4: get pred and succ of next and prev, coalesce them, 
- *            and link pred and succ with coalesced block again, remove one of next and prev from LIFO list
+ * 2. case 2: remove next
+ * 3. case 3: remove prev
+ * 4. case 4: remove next and prev
  * 
  */
 #include <stdio.h>
@@ -151,7 +150,7 @@ int mm_init(void)
     PUT(hp, 0); /* alignment padding */
     PUT(hp + (1*WSIZE), PACK(DSIZE, 1)); /* prologue header */
     PUT(hp + (2*WSIZE), PACK(DSIZE, 1)); /* prologue footer */
-    PUT(hp + (3*WSIZE), PACK(DSIZE, 1)); /* epilogue header */
+    PUT(hp + (3*WSIZE), PACK(0, 1)); /* epilogue header */
     hp += DSIZE; 
 
     #ifdef NEXT_FIT
@@ -207,7 +206,6 @@ void mm_free(void *ptr)
     size_t size = GET_SIZE(HDRP(ptr));
     PUT(HDRP(ptr), PACK(size, 0)); 
     PUT(FTRP(ptr), PACK(size, 0));  
-    insert_head(ptr);
     coalesce(ptr);
     checkheap(void);
     return;
@@ -273,23 +271,29 @@ static void *coalesce(void *bp)
         return bp;
     }
     else if (prev_alloc && !next_alloc) { /* prev block is allocated while next is not */
+        remove(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
     else if (!prev_alloc && next_alloc) { /* next block is allocated while prev is not */
+        remove(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
     else { /* both prev and next blocks are not allocated */
+        remove(PREV_BLKP(bp));
+        remove(NEXT_BLKP(bp));
         size += GET_SIZE(FTRP(NEXT_BLKP(bp)));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
+
+    insert_head(bp);
 
     #ifdef NEXT_FIT
     /* Make sure the rover isn't pointing into the free block */
@@ -337,15 +341,14 @@ static void *find_fit(size_t size)
 static void place(char *bp, size_t size)
 {
     size_t diff = GET_SIZE(HDRP(bp)) - size;
-    
+    remove(bp);
+
     if (diff <= DSIZE * 3) { /* remaining space is not enough to construct a new block */
         PUT(HDRP(bp), PACK(GET_SIZE(HDRP(bp)), 1));
         PUT(FTRP(bp), PACK(GET_SIZE(HDRP(bp)), 1));
-        remove(bp);
     } else { /* split the block */
         PUT(HDRP(bp), PACK(size, 1));
         PUT(FTRP(bp), PACK(size, 1));
-        remove(bp);
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(diff, 0));
         PUT(FTRP(bp), PACK(diff, 0));
@@ -374,7 +377,11 @@ static inline void remove(void *bp)
     void *pred = GET_PRED(bp);
     void *succ = GET_SUCC(bp);
     SET_PRED(succ, pred);
-    SET_SUCC(pred, succ);
+    if (pred == &fbp) { /* pred is fbp */
+        fbp = succ;
+    } else {
+        SET_SUCC(pred, succ);
+    }
 }
 
 void mm_checkheap(void)
