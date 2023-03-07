@@ -21,20 +21,26 @@
  | free block ptr | <-> | free blocks | -> | tail | 
  *----------------       -------------      ------
  * 
+ * add
+ * insert_head:
+ * 1. insert the free block into LIFO list
+ * remove_block:
+ * 1. remove block from LIFO list
+ * mm_checkfree:
+ * 1. check the LIFO list
+ * 
  * modify
  * mm_init: 
- * 1. free block pointer fbp points to first free block
- * 2. pred of frist free block points the address of fbp pointer
- * 2. succ of last free block points to the address of tail pointer
- * mm_malloc: (same)
+ * 1. fbp points to tail, tail points to fbp
+ * mm_malloc: 
+ * 1. remove free block while place
  * mm_free:
  * 1. add free block to LIFO list
- * mm_realloc: (same)
+ * mm_realloc: 
+ * 1. if oldsize >= newsize, return
+ * 2. merge next block if possible
  * find_fit:
  * 1. search from LIFO list
- * place:
- * 1. if split, remove block from LIFO list, add the splited block 
- * 2. if not split, just remove the block from LIFO list
  * extend_heap:
  * 1. add the extended block to LIFO list
  * coalesce:
@@ -44,6 +50,8 @@
  * 2. case 2: remove next
  * 3. case 3: remove prev
  * 4. case 4: remove next and prev
+ * place:
+ * 1. add splited free block into LIFO list if split
  * 
  */
 #include <stdio.h>
@@ -84,7 +92,7 @@ team_t team = {
 #define ALIGNMENT 8
 #define WSIZE 4
 #define DSIZE 8
-#define CHUNKSIZE (1 << 12)
+#define CHUNKSIZE (1 << 6)
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
@@ -137,7 +145,10 @@ static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void *find_fit(size_t size);
 static void place(char *bp, size_t size);
+static inline void insert_head(void *bp);
+static inline void remove_block(void *bp);
 void mm_checkheap(void);
+void mm_checkfree(void);
 
 
 /* 
@@ -152,6 +163,9 @@ int mm_init(void)
     PUT(hp + (2*WSIZE), PACK(DSIZE, 1)); /* prologue footer */
     PUT(hp + (3*WSIZE), PACK(0, 1)); /* epilogue header */
     hp += DSIZE; 
+    
+    fbp = &tail; /* set up the head and tail of LIFO */
+    tail = &fbp; 
 
     #ifdef NEXT_FIT
     rover = hp;
@@ -160,9 +174,7 @@ int mm_init(void)
     /* extend the empty heap with a free block of CHUNKSIZE bytes */
     if ((fbp = extend_heap(CHUNKSIZE / WSIZE)) == NULL)
         return -1;
-    SET_PRED(fbp, &fbp); /* set up the head and tail of LIFO */
-    SET_SUCC(fbp, &tail); 
-    checkheap(void);
+    
     return 0;
 }
 
@@ -186,13 +198,15 @@ void *mm_malloc(size_t size)
     }
 
     if ((bp = find_fit(asize)) != NULL) { /* search the free slot to place*/
-	place(bp, asize);
+       remove_block(bp);
+	    place(bp, asize);
         return bp;
     }
     extendsize = MAX(asize, CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
-    
+        
+    remove_block(bp);
     place(bp, asize);
     return bp;
 }
@@ -206,8 +220,8 @@ void mm_free(void *ptr)
     size_t size = GET_SIZE(HDRP(ptr));
     PUT(HDRP(ptr), PACK(size, 0)); 
     PUT(FTRP(ptr), PACK(size, 0));  
-    coalesce(ptr);
-    checkheap(void);
+    ptr = coalesce(ptr);
+    insert_head(ptr);
     return;
 }
 
@@ -217,8 +231,9 @@ void mm_free(void *ptr)
 void *mm_realloc(void *ptr, size_t size)
 {
     size_t oldsize;
+    size_t asize;
     void *newptr;
-    
+
     if (size == 0) { /* if size is 0, just call mm_free(ptr) */
     	mm_free(ptr);
     	return NULL;
@@ -228,17 +243,46 @@ void *mm_realloc(void *ptr, size_t size)
     	return mm_malloc(size);
     }
     
+    asize = ALIGN(size + DSIZE);
+    oldsize = GET_SIZE(HDRP(ptr));
+    
+    if (asize <= oldsize) { 
+    	return ptr;
+    }
+    
+    /* only merge next if possible */
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    if (!next_alloc && (oldsize + next_size) >= asize) {
+        remove_block(NEXT_BLKP(ptr));
+        PUT(HDRP(ptr), PACK((oldsize+next_size), 1));
+        PUT(FTRP(ptr), PACK((oldsize+next_size), 1));
+        return ptr;
+    }
+    
     newptr = mm_malloc(size);
     if (newptr == NULL)
-      	return NULL;
-    
-    /* copy the old data */
-    oldsize = GET_SIZE(HDRP(ptr));
-    if (size < oldsize) oldsize = size;
+	return NULL;
     memcpy(newptr, ptr, oldsize);
-    
-    mm_free(ptr); /* release the old block */
+    mm_free(ptr);
     return newptr;
+    
+    
+    /* merge next and prev if possible (lower thru)
+    newptr = coalesce(ptr);
+    
+    if (GET_SIZE(HDRP(newptr)) < asize) {
+    	void *allocptr = mm_malloc(size);
+	if (allocptr == NULL)
+	    return NULL;
+	memcpy(allocptr, ptr, oldsize);
+	mm_free(newptr);
+	return allocptr;
+    }
+    
+    memmove(newptr, ptr, oldsize);
+    place(newptr, asize);
+    return newptr; */
 }
 
 /* 
@@ -255,7 +299,9 @@ static void *extend_heap(size_t words)
     PUT(HDRP(bp), PACK(size, 0)); /* free block header */
     PUT(FTRP(bp), PACK(size, 0)); /* free block footer */
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* new epilogue header */
-    return coalesce(bp); /* coalesce if the prev block is free */
+    bp = coalesce(bp); /* coalesce if the prev block is free */
+    insert_head(bp);
+    return bp; 
 }
 
 /*
@@ -271,29 +317,27 @@ static void *coalesce(void *bp)
         return bp;
     }
     else if (prev_alloc && !next_alloc) { /* prev block is allocated while next is not */
-        remove(NEXT_BLKP(bp));
+        remove_block(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
     else if (!prev_alloc && next_alloc) { /* next block is allocated while prev is not */
-        remove(PREV_BLKP(bp));
+        remove_block(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
     else { /* both prev and next blocks are not allocated */
-        remove(PREV_BLKP(bp));
-        remove(NEXT_BLKP(bp));
+        remove_block(PREV_BLKP(bp));
+        remove_block(NEXT_BLKP(bp));
         size += GET_SIZE(FTRP(NEXT_BLKP(bp)));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
-
-    insert_head(bp);
 
     #ifdef NEXT_FIT
     /* Make sure the rover isn't pointing into the free block */
@@ -327,7 +371,7 @@ static void *find_fit(size_t size)
     #else 
         /* first fit search */
         void *cur;
-        for (cur = fbp; cur != tail; cur = GET_SUCC(cur)) {
+        for (cur = fbp; cur != &tail; cur = GET_SUCC(cur)) {
             if (GET_SIZE(HDRP(cur)) >= size)
                 return cur;
         }
@@ -341,7 +385,6 @@ static void *find_fit(size_t size)
 static void place(char *bp, size_t size)
 {
     size_t diff = GET_SIZE(HDRP(bp)) - size;
-    remove(bp);
 
     if (diff <= DSIZE * 3) { /* remaining space is not enough to construct a new block */
         PUT(HDRP(bp), PACK(GET_SIZE(HDRP(bp)), 1));
@@ -372,7 +415,7 @@ static inline void insert_head(void *bp)
 /*
  * remove block bp from LIFO list
  */
-static inline void remove(void *bp) 
+static inline void remove_block(void *bp) 
 {
     void *pred = GET_PRED(bp);
     void *succ = GET_SUCC(bp);
@@ -395,6 +438,14 @@ void mm_checkheap(void)
     printf("******end of heap******\n");
 }
 
+void mm_checkfree(void)
+{
+    void *cur;
+    int i = 0;
+    for (cur = fbp; cur != &tail; cur = GET_SUCC(cur), i++) {
+    	printf("%d node is %p, pred: %p, succ: %p with size %d\n", i, cur, GET_PRED(cur), GET_SUCC(cur), GET_SIZE(HDRP(cur)));
+    }
+}
 
 
 
