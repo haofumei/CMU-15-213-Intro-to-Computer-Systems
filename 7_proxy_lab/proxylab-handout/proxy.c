@@ -1,9 +1,15 @@
 #include <stdio.h>
 #include "csapp.h"
+#include "sbuf.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+
+#define NTHREADS 4
+#define SBUFSIZE 16
+
+sbuf_t sbuf; /* Shared buffer of connected descriptors */
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
@@ -16,6 +22,7 @@ void forward_server(rio_t *rp, char *method, char *path,
                       char *hostname, int clientfd);
 void forward_client(int clientfd, rio_t *rs);
 
+void *thread(void *vargp);
 
 int main(int argc, char **argv)
 {
@@ -23,6 +30,7 @@ int main(int argc, char **argv)
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
+    pthread_t tid;
 
     /* Check command line args */
     if (argc != 2) {
@@ -30,14 +38,18 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    sbuf_init(&sbuf, SBUFSIZE);
+    for (int i = 0; i < NTHREADS; i++) /* create worker threads */
+        Pthread_create(&tid, NULL, thread, NULL);
+
     listenfd = Open_listenfd(argv[1]);
     while (1) {
         clientlen = sizeof(clientaddr);
         connfd = Accept(listenfd, (SA *) &clientaddr, &clientlen);
+        sbuf_insert(&sbuf, connfd); /* Insert connfd in buffer */
+
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Proxy accepted connection from (%s, %s)\n", hostname, port);
-        doit(connfd);
-        Close(connfd);
     }
 }
 
@@ -69,7 +81,12 @@ void doit(int fd)
         return;
     }
 
-    serverfd = Open_clientfd(hostname, port); 
+    if ((serverfd = open_clientfd(hostname, port)) < 0) { /* handle page not found */
+        clienterror(fd, method, "404", "Not found",
+                    "Connection refused");
+        return;
+    }
+
     Rio_readinitb(&rs, serverfd);
 
     forward_server(&rc, method, path, hostname, serverfd);
@@ -168,4 +185,15 @@ void forward_client(int clientfd, rio_t *rs)
         Rio_writen(clientfd, buf, size);
         printf("%s", buf);
     }
+}
+
+void *thread(void *vargp)
+{
+    Pthread_detach(pthread_self());
+    while(1) {
+        int connfd = sbuf_remove(&sbuf);
+        doit(connfd);
+        Close(connfd);
+    }
+    return NULL;
 }
