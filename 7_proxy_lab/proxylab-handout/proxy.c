@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "csapp.h"
 #include "sbuf.h"
+#include "LRUCache.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
@@ -9,20 +10,44 @@
 #define NTHREADS 4
 #define SBUFSIZE 16
 
-sbuf_t sbuf; /* Shared buffer of connected descriptors */
+/*************************
+ * Value******************
+ *************************/
+
+static sbuf_t sbuf; /* Shared buffer of connected descriptors */
+
+/* valuables for readers-writers */
+volatile int incnt = 0;
+volatile int outcnt = 0;
+volatile int wrtwait = 0;
+sem_t in, out, wrt; 
+
+static LRUCache *cache;
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 
+/*************************
+ * Function***************
+ *************************/
+
+/* regular function */
 void doit(int fd);
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
 int parse_uri(char *uri, char *hostname, char *port, char *path);
 void forward_server(rio_t *rp, char *method, char *path, 
                       char *hostname, int clientfd);
-void forward_client(int clientfd, rio_t *rs);
+void forward_client(int clientfd, rio_t *rs, char *key);
 
+/* concurrency */
 void *thread(void *vargp);
+Node *read_cache(char *key, LRUCache *cache);
+void write_cache(char *key, byte *val, int len, LRUCache *cache);
+
+/* signal */
+void sigpipe_handler(int signal);
+
 
 int main(int argc, char **argv)
 {
@@ -38,7 +63,18 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    /* Initiate the sbuf and readers-writers */
     sbuf_init(&sbuf, SBUFSIZE);
+    Sem_init(&in, 0, 1);
+    Sem_init(&out, 0, 1);
+    Sem_init(&wrt, 0, 0);
+
+    /* Initiate the cache */
+    cache = initLRUCache(MAX_CACHE_SIZE);
+
+    /* Install the signal handlers */
+    Signal(SIGPIPE, sigpipe_handler);
+
     for (int i = 0; i < NTHREADS; i++) /* create worker threads */
         Pthread_create(&tid, NULL, thread, NULL);
 
@@ -49,9 +85,14 @@ int main(int argc, char **argv)
         sbuf_insert(&sbuf, connfd); /* Insert connfd in buffer */
 
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
-        printf("Proxy accepted connection from (%s, %s)\n", hostname, port);
     }
+
+    freeCache(cache);
 }
+
+/*************************
+ * Regular Function*******
+ *************************/
 
 /*
  * take care one request from client
@@ -62,26 +103,38 @@ void doit(int fd)
     int serverfd;
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], 
          version[MAXLINE], hostname[MAXLINE], path[MAXLINE], port[MAXLINE];
+    Node *node;
     
     /* read request first line header */
     Rio_readinitb(&rc, fd);
     if (!Rio_readlineb(&rc, buf, MAXLINE))
         return;
     sscanf(buf, "%s %s %s", method, uri, version);
-    printf("%s", buf);
-    if (strcasecmp(method, "GET")) { /* only support GET method for now */
+
+    /* only support GET method for now */
+    if (strcasecmp(method, "GET")) { 
         clienterror(fd, method, "501", "Not implemented",
                     "Tiny does not implement this method");
         return;
     }
-    
-    if (!parse_uri(uri, hostname, port, path)) { /* invalid uri */
+
+    /* invalid uri */
+    if (!parse_uri(uri, hostname, port, path)) { 
         clienterror(fd, method, "400", "Bad request",
                     "Host name is invalid");
         return;
     }
+    
+    printf("Client request (%s, %s)\n", hostname, port);
+    /* if cache exist */
+    if ((node = read_cache(buf, cache))) { 
+    	printf("Read from cache: %d\n", node->len);
+        Rio_writen(fd, node->val, node->len);
+        return;
+    }
 
-    if ((serverfd = open_clientfd(hostname, port)) < 0) { /* handle page not found */
+    /* handle page not found */
+    if ((serverfd = open_clientfd(hostname, port)) < 0) { 
         clienterror(fd, method, "404", "Not found",
                     "Connection refused");
         return;
@@ -90,7 +143,7 @@ void doit(int fd)
     Rio_readinitb(&rs, serverfd);
 
     forward_server(&rc, method, path, hostname, serverfd);
-    forward_client(fd, &rs);
+    forward_client(fd, &rs, buf);
     
     Close(serverfd);
 }
@@ -155,7 +208,6 @@ void forward_server(rio_t *rp, char *method, char *path,
     sprintf(buf, "%sProxy-Connection: close\r\n", buf);
 
     Rio_writen(clientfd, buf, strlen(buf)); /* write the fixed part of header to origin server */
-    printf("%s", buf);
 
     /* read the rest of header */
     Rio_readlineb(rp, buf, MAXLINE);         
@@ -163,30 +215,46 @@ void forward_server(rio_t *rp, char *method, char *path,
         if (!strstr(buf, "Host") && !strstr(buf, "User-Agent") &&
                 !strstr(buf, "Connection") && !strstr(buf, "Proxy-Connection")) {
             Rio_writen(clientfd, buf, strlen(buf));
-            printf("%s", buf);
         }
         Rio_readlineb(rp, buf, MAXLINE);
     }
-    strcpy(buf, "\r\n");
+    strcpy(buf, "\r\n"); /* new line indicates end of header */
     Rio_writen(clientfd, buf, strlen(buf));
-    printf("%s", buf);
 }
 
 /*
  * receive the response from server
  * forward to the origin client 
  */
-void forward_client(int clientfd, rio_t *rs)
+void forward_client(int clientfd, rio_t *rs, char *key)
 {
-    char buf[MAXLINE];
-    int size;
+    byte buf[MAX_OBJECT_SIZE];
+    int size, sum = 0;
 
-    while ((size = Rio_readnb(rs, buf, MAXLINE)) != 0) {
-        Rio_writen(clientfd, buf, size);
-        printf("%s", buf);
+    while ((size = Rio_readnb(rs, buf, MAX_OBJECT_SIZE)) != 0) {
+        if (size < 0 && errno == EPIPE) { /* handle SIGPIPE */
+            printf("Socket closed by remote host\n");
+            break;
+        } else {
+            Rio_writen(clientfd, buf, size);
+            sum += size;
+        }
+    }
+
+    if (sum <= MAX_OBJECT_SIZE) { /* store in the cache */
+        write_cache(key, buf, sum, cache);
+        printf("Write %d into cache\n and size is %d\n", sum, cache->size);
+        printCache(cache);
     }
 }
 
+/*************************
+ * Concurrency************
+ *************************/
+
+/*
+ * thread routine for dealing socket on the sbuf
+ */
 void *thread(void *vargp)
 {
     Pthread_detach(pthread_self());
@@ -196,4 +264,54 @@ void *thread(void *vargp)
         Close(connfd);
     }
     return NULL;
+}
+
+
+/*
+ * Read val from cache with given header
+ */
+Node *read_cache(char *key, LRUCache *cache)
+{
+    /* Create the header */
+    Node *node;
+
+    P(&in);
+    incnt++;
+    V(&in);
+    /* Critical section */
+    node = get(cache, key);
+    P(&out);
+    outcnt++;
+    if (wrtwait == 1 && incnt == outcnt)
+        V(&wrt);
+    V(&out);
+    return node;
+}
+
+/*
+ * Write the val with given key into cache
+ */
+void write_cache(char *key, byte *val, int len, LRUCache *cache)
+{
+    P(&in);
+    P(&out);
+    if (incnt == outcnt) {
+        V(&out);
+    } else {
+        wrtwait = 1;
+        V(&out);
+        P(&wrt);
+        wrtwait = 0;
+    }
+    /* Critical section for writer */
+    put(cache, key, val, len);
+    V(&in);
+}
+
+/*************************
+ * Signal*****************
+ *************************/
+
+void sigpipe_handler(int signal) {
+    printf("Received SIGPIPE signal\n");
 }
